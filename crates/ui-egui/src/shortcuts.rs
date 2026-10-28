@@ -516,7 +516,17 @@ pub fn handle(app: &mut LightcraftApp, ctx: &egui::Context) {
         } else if matches!(f.as_str(), "photo.decreaseRating" | "photo.increaseRating") {
             cull(app, &f, json!({}), false);
         } else if let Some(l) = f.strip_prefix("label:") {
-            cull(app, "photo.label", json!({"label": l}), false);
+            let mut params = json!({"label": l});
+            compare::target_active(app, &mut params);
+            let ids: Vec<lightcraft_catalog::PhotoId> = params
+                .get("ids")
+                .and_then(serde_json::Value::as_array)
+                .map(|ids| ids.iter().filter_map(serde_json::Value::as_u64).map(lightcraft_catalog::PhotoId).collect())
+                .unwrap_or_else(|| app.session.selection.ids.clone());
+            let label = lightcraft_catalog::ColorLabel::parse(l);
+            let clear =
+                label.is_some() && !ids.is_empty() && ids.iter().all(|id| app.session.catalog.photo(*id).is_some_and(|photo| photo.label == label));
+            cull(app, "photo.label", json!({"label": if clear { "none" } else { l }}), false);
         } else if f == "panel.presets" && library_grid(app) {
             // Classic's Shift+P picks and advances in Library; keep the Presets binding elsewhere.
             cull(app, "photo.flag", json!({"flag": "pick"}), true);
@@ -1004,6 +1014,17 @@ mod tests {
         assert_eq!(h.app.session.catalog.photo(PhotoId(1)).unwrap().label, None);
         assert_eq!(h.app.session.catalog.photo(PhotoId(2)).unwrap().label, Some(ColorLabel::Red));
         assert_eq!(h.app.session.active(), Some(PhotoId(3)));
+    }
+
+    #[test]
+    fn label_keys_toggle_off_when_every_selected_photo_already_has_that_colour() {
+        use lightcraft_catalog::PhotoId;
+        let mut h = library();
+        h.app.session.execute("library.select", &json!({"ids": [1, 2]})).unwrap();
+        h.app.run("photo.label", json!({"label": "red"})).unwrap();
+        key(&mut h, "6", false);
+        assert_eq!(h.app.session.catalog.photo(PhotoId(1)).unwrap().label, None);
+        assert_eq!(h.app.session.catalog.photo(PhotoId(2)).unwrap().label, None);
     }
 
     #[test]
