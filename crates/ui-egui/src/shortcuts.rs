@@ -287,13 +287,21 @@ pub fn parse(s: &str) -> Option<(Modifiers, Key)> {
 }
 
 fn matches(i: &egui::InputState, m: Modifiers, k: Key) -> bool {
+    matches_key(i, m, k, false)
+}
+
+fn matches_without_repeat(i: &egui::InputState, m: Modifiers, k: Key) -> bool {
+    matches_key(i, m, k, true)
+}
+
+fn matches_key(i: &egui::InputState, m: Modifiers, k: Key, ignore_repeat: bool) -> bool {
     // the windowing layer turns ⌘C / ⌘X / ⌘V (with any other modifiers held) and the keyboard's
     // Copy / Cut / Paste keys into these on Windows and Linux (macOS's menu bar takes them first);
     // without ⌘/Ctrl held they came from a key that is the plain command (Windows' ⇧Insert pastes)
     let clipboard = if i.modifiers.command { i.modifiers } else { Modifiers::COMMAND };
     i.events.iter().any(|e| {
         let (key, physical_key, modifiers) = match e {
-            egui::Event::Key { key, physical_key, pressed: true, modifiers, .. } => (key, physical_key, modifiers),
+            egui::Event::Key { key, physical_key, pressed: true, repeat, modifiers } if !ignore_repeat || !*repeat => (key, physical_key, modifiers),
             egui::Event::Copy => (&Key::C, &None, &clipboard),
             egui::Event::Cut => (&Key::X, &None, &clipboard),
             egui::Event::Paste(_) => (&Key::V, &None, &clipboard),
@@ -418,7 +426,7 @@ pub fn handle(app: &mut LightcraftApp, ctx: &egui::Context) {
                 && let Some((m, k)) = parse(sc)
                 && !native(sc)
                 && !(k == Key::Escape && popup_open)
-                && matches(i, m, k)
+                && if b.id == "photo.label" { matches_without_repeat(i, m, k) } else { matches(i, m, k) }
                 && let Some(id) = grid_key_command(keymap, grid, app.ui.fullscreen, b.id, (m, k))
             {
                 fire.push(id.to_string());
@@ -428,7 +436,7 @@ pub fn handle(app: &mut LightcraftApp, ctx: &egui::Context) {
             if let Some((m, k)) = parse(sc).filter(|_| !native(sc))
                 && !(k == Key::Escape && popup_open)
                 && !taken.contains(&(m, k))
-                && matches(i, m, k)
+                && if *id == "photo.label" { matches_without_repeat(i, m, k) } else { matches(i, m, k) }
             {
                 aliased.push((id, serde_json::from_str(params).unwrap_or_default()));
             }
@@ -443,7 +451,7 @@ pub fn handle(app: &mut LightcraftApp, ctx: &egui::Context) {
             }
         }
         for (label, key, sc) in [("red", Key::Num6, "6"), ("yellow", Key::Num7, "7"), ("green", Key::Num8, "8"), ("blue", Key::Num9, "9")] {
-            if matches(i, Modifiers::NONE, key) && !native(sc) && !taken.contains(&(Modifiers::NONE, key)) {
+            if matches_without_repeat(i, Modifiers::NONE, key) && !native(sc) && !taken.contains(&(Modifiers::NONE, key)) {
                 fire.push(format!("label:{label}"));
             }
         }
@@ -489,6 +497,10 @@ pub fn handle(app: &mut LightcraftApp, ctx: &egui::Context) {
             if let Some(o) = params.as_object_mut() {
                 o.remove("advance");
             }
+            if id == "photo.label" {
+                let label = params.get("label").and_then(serde_json::Value::as_str).unwrap_or_default().to_string();
+                params = label_shortcut_params(app, &label, params);
+            }
             cull(app, id, params, advance);
         } else if let Err(e) = app.run(id, params)
             && matches!(id, "app.export" | "app.exportPrevious")
@@ -516,17 +528,8 @@ pub fn handle(app: &mut LightcraftApp, ctx: &egui::Context) {
         } else if matches!(f.as_str(), "photo.decreaseRating" | "photo.increaseRating") {
             cull(app, &f, json!({}), false);
         } else if let Some(l) = f.strip_prefix("label:") {
-            let mut params = json!({"label": l});
-            compare::target_active(app, &mut params);
-            let ids: Vec<lightcraft_catalog::PhotoId> = params
-                .get("ids")
-                .and_then(serde_json::Value::as_array)
-                .map(|ids| ids.iter().filter_map(serde_json::Value::as_u64).map(lightcraft_catalog::PhotoId).collect())
-                .unwrap_or_else(|| app.session.selection.ids.clone());
-            let label = lightcraft_catalog::ColorLabel::parse(l);
-            let clear =
-                label.is_some() && !ids.is_empty() && ids.iter().all(|id| app.session.catalog.photo(*id).is_some_and(|photo| photo.label == label));
-            cull(app, "photo.label", json!({"label": if clear { "none" } else { l }}), false);
+            let params = label_shortcut_params(app, l, json!({"label": l}));
+            cull(app, "photo.label", params, false);
         } else if f == "panel.presets" && library_grid(app) {
             // Classic's Shift+P picks and advances in Library; keep the Presets binding elsewhere.
             cull(app, "photo.flag", json!({"flag": "pick"}), true);
@@ -724,6 +727,21 @@ pub fn handle(app: &mut LightcraftApp, ctx: &egui::Context) {
 
 pub(crate) fn library_grid(app: &LightcraftApp) -> bool {
     matches!(app.ui.view, crate::state::ViewMode::PhotoGrid | crate::state::ViewMode::SquareGrid)
+}
+
+fn label_shortcut_params(app: &LightcraftApp, label_name: &str, mut params: serde_json::Value) -> serde_json::Value {
+    crate::panels::compare::target_active(app, &mut params);
+    let ids: Vec<lightcraft_catalog::PhotoId> = params
+        .get("ids")
+        .and_then(serde_json::Value::as_array)
+        .map(|ids| ids.iter().filter_map(serde_json::Value::as_u64).map(lightcraft_catalog::PhotoId).collect())
+        .unwrap_or_else(|| app.session.selected());
+    let label = lightcraft_catalog::ColorLabel::parse(label_name);
+    let clear = label.is_some() && !ids.is_empty() && ids.iter().all(|id| app.session.catalog.photo(*id).is_some_and(|photo| photo.label == label));
+    if clear {
+        params["label"] = json!("none");
+    }
+    params
 }
 
 #[cfg(test)]
@@ -1025,6 +1043,50 @@ mod tests {
         key(&mut h, "6", false);
         assert_eq!(h.app.session.catalog.photo(PhotoId(1)).unwrap().label, None);
         assert_eq!(h.app.session.catalog.photo(PhotoId(2)).unwrap().label, None);
+    }
+
+    #[test]
+    fn label_keys_use_the_active_photo_when_the_selection_ids_are_empty() {
+        use lightcraft_catalog::PhotoId;
+        let mut h = library();
+        h.app.run("photo.label", json!({"ids": [1], "label": "red"})).unwrap();
+        h.app.session.execute("library.select", &json!({"ids": [], "active": 1})).unwrap();
+        key(&mut h, "6", false);
+        assert_eq!(h.app.session.catalog.photo(PhotoId(1)).unwrap().label, None);
+    }
+
+    #[test]
+    fn shift_label_shortcut_toggles_off_and_still_advances() {
+        use lightcraft_catalog::PhotoId;
+        let mut h = library();
+        h.app.run("photo.label", json!({"ids": [1], "label": "red"})).unwrap();
+        key(&mut h, "6", true);
+        assert_eq!(h.app.session.catalog.photo(PhotoId(1)).unwrap().label, None);
+        assert_eq!(h.app.session.active(), Some(PhotoId(2)));
+    }
+
+    #[test]
+    fn repeated_label_key_event_does_not_toggle_again() {
+        for (modifiers, shortcut_modifiers) in [(Modifiers::NONE, Modifiers::NONE), (Modifiers::SHIFT, Modifiers::SHIFT)] {
+            let mut view = crate::headless::HeadlessView::new();
+            for (repeat, expected) in [(false, true), (true, false)] {
+                let event = egui::Event::Key { key: Key::Num6, physical_key: Some(Key::Num6), pressed: true, repeat, modifiers };
+                let mut matched = false;
+                let mut observed_repeat = None;
+                let raw = crate::headless::HeadlessView::raw_input(egui::vec2(100.0, 100.0), 1.0, 0.0, vec![event]);
+                view.run(raw, |ui| {
+                    ui.input(|input| {
+                        observed_repeat = input.events.iter().find_map(|event| match event {
+                            egui::Event::Key { key: Key::Num6, repeat, .. } => Some(*repeat),
+                            _ => None,
+                        });
+                        matched = matches_without_repeat(input, shortcut_modifiers, Key::Num6);
+                    });
+                });
+                assert_eq!(observed_repeat, Some(repeat));
+                assert_eq!(matched, expected, "repeat={repeat}, modifiers={modifiers:?}");
+            }
+        }
     }
 
     #[test]
