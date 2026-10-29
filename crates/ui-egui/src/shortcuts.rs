@@ -107,7 +107,6 @@ pub fn assign(keymap: &mut Keymap, id: &str, sc: Option<&str>) -> Result<Vec<&'s
         None => None,
         Some(s) => {
             let key = parse(s).ok_or_else(|| format!("not a shortcut: {s}"))?;
-            // store the canonical spelling so equal keys compare equal (menus, native accelerators)
             let canonical = format(key.0, key.1).unwrap_or_else(|| s.to_string());
             if RESERVED.iter().any(|r| parse(r) == Some(key)) {
                 return Err(format!("{canonical} is reserved for the app menu"));
@@ -186,13 +185,12 @@ pub fn format(m: Modifiers, k: Key) -> Option<String> {
         Key::Quote => "'",
         Key::Comma => ",",
         Key::Backtick => "`",
-        k => k.name(),
+        key => key.name(),
     };
     let mut s = String::new();
     if m.command || m.mac_cmd {
         s.push_str("Cmd+");
     }
-    // off macOS Ctrl *is* Cmd; on macOS it is the separate Control key
     if m.ctrl && (m.mac_cmd || !m.command) {
         s.push_str("Ctrl+");
     }
@@ -257,33 +255,27 @@ pub fn parse(s: &str) -> Option<(Modifiers, Key)> {
             "Shift" => m.shift = true,
             "Alt" => m.alt = true,
             "Ctrl" => m.ctrl = true,
-            // "Delete" means the key labelled ⌫ (egui's Backspace); forward-delete also matches, see `matches`.
-            "Delete" => key = Some(Key::Backspace),
-            k => {
-                // an unknown part (`Hyper`, a typo) makes the whole shortcut invalid
-                key = Some(
-                    Key::from_name(k)
-                        .or(match k {
-                            "Right" => Some(Key::ArrowRight),
-                            "Left" => Some(Key::ArrowLeft),
-                            "Up" => Some(Key::ArrowUp),
-                            "Down" => Some(Key::ArrowDown),
-                            "\\" => Some(Key::Backslash),
-                            "/" => Some(Key::Slash),
-                            "=" => Some(Key::Equals),
-                            "-" => Some(Key::Minus),
-                            "[" => Some(Key::OpenBracket),
-                            "]" => Some(Key::CloseBracket),
-                            "'" => Some(Key::Quote),
-                            "," => Some(Key::Comma),
-                            _ => None,
-                        })
-                        .filter(|k| !is_modifier(*k))?,
-                )
-            }
+            "Delete" | "Backspace" => key = Some(Key::Backspace),
+            "Enter" | "Return" => key = Some(Key::Enter),
+            "Esc" | "Escape" => key = Some(Key::Escape),
+            "Left" => key = Some(Key::ArrowLeft),
+            "Right" => key = Some(Key::ArrowRight),
+            "Up" => key = Some(Key::ArrowUp),
+            "Down" => key = Some(Key::ArrowDown),
+            "/" => key = Some(Key::Slash),
+            "\\" => key = Some(Key::Backslash),
+            "=" => key = Some(Key::Equals),
+            "-" => key = Some(Key::Minus),
+            "[" | "{" => key = Some(Key::OpenBracket),
+            "]" | "}" => key = Some(Key::CloseBracket),
+            "'" => key = Some(Key::Quote),
+            "," => key = Some(Key::Comma),
+            "`" => key = Some(Key::Backtick),
+            "Space" => key = Some(Key::Space),
+            _ => key = Some(*Key::ALL.iter().find(|key| key.name().eq_ignore_ascii_case(part))?),
         }
     }
-    key.map(|k| (m, k))
+    key.filter(|key| !is_modifier(*key)).map(|k| (m, k))
 }
 
 fn matches(i: &egui::InputState, m: Modifiers, k: Key) -> bool {
@@ -394,24 +386,27 @@ pub fn handle(app: &mut LightcraftApp, ctx: &egui::Context) {
     if keyboard_owned(app, ctx) || app.recording_shortcut.is_some() || app.ui.name_edit.is_some() {
         return;
     }
+    let (fire, aliased) = pressed_commands(app, ctx);
+    for (id, params) in aliased {
+        fire_alias(app, ctx, id, params);
+    }
+    let rotate_fires = fire.iter().any(|f| f == "crop.rotateAspect");
+    for f in fire {
+        fire_command(app, ctx, &f, rotate_fires);
+    }
+}
+
+/// The keys pressed this frame: the commands to fire, and the aliases (command and params) to run.
+fn pressed_commands(app: &LightcraftApp, ctx: &egui::Context) -> (Vec<String>, Vec<(&'static str, serde_json::Value)>) {
     let mut fire: Vec<String> = Vec::new();
-    // shortcuts the native menu bar handles (it consumes those key presses itself)
     let native = |sc: &str| app.native_shortcuts.contains(sc);
-    let mut aliased: Vec<(&str, serde_json::Value)> = Vec::new();
+    let mut aliased: Vec<(&'static str, serde_json::Value)> = Vec::new();
     let keymap = &app.ui.settings.keymap;
     let grid = library_grid(app);
-    // The grid navigation keys act on the photos in view, so they wait while the full-screen preview
-    // covers the grid: a key must not move the selection onto photos nobody can see.
     let grid_navigation = grid && !app.ui.fullscreen;
-    // keys the user gave to a known command: the fixed bindings below (aliases, ratings) yield to them
     let taken: Vec<(Modifiers, Key)> = saved_keys(keymap).map(|(_, k)| k).collect();
-    // an open popup (a menu, a date picker's calendar) closes on Esc itself: Esc's command (Back,
-    // which also closes dialogs) waits until nothing is open
-    let popup_open = egui::Popup::is_any_open(ctx);
-    // Esc that just took a text field's focus away (it gives back the field's text) does nothing else
-    let popup_open = popup_open || app.text_focus;
+    let popup_open = egui::Popup::is_any_open(ctx) || app.text_focus;
     ctx.input(|i| {
-        // Enter opens the active grid photo; widgets, popups and custom bindings keep the key.
         if grid
             && app.session.active().is_some()
             && !popup_open
@@ -436,291 +431,353 @@ pub fn handle(app: &mut LightcraftApp, ctx: &egui::Context) {
             if let Some((m, k)) = parse(sc).filter(|_| !native(sc))
                 && !(k == Key::Escape && popup_open)
                 && !taken.contains(&(m, k))
+                && !fire.iter().any(|f| f == *id)
                 && if *id == "photo.label" { matches_without_repeat(i, m, k) } else { matches(i, m, k) }
             {
                 aliased.push((id, serde_json::from_str(params).unwrap_or_default()));
             }
         }
-        // rating 0-5, colour labels 6-9 (with Shift: and advance)
-        for (n, key) in [Key::Num0, Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5].iter().enumerate() {
-            if matches(i, Modifiers::NONE, *key) && !native(&n.to_string()) && !taken.contains(&(Modifiers::NONE, *key)) {
-                fire.push(format!("rate:{n}:0"));
-            }
-            if matches(i, Modifiers::SHIFT, *key) && !taken.contains(&(Modifiers::SHIFT, *key)) {
-                fire.push(format!("rate:{n}:1"));
-            }
-        }
-        for (label, key, sc) in [("red", Key::Num6, "6"), ("yellow", Key::Num7, "7"), ("green", Key::Num8, "8"), ("blue", Key::Num9, "9")] {
-            if matches_without_repeat(i, Modifiers::NONE, key) && !native(sc) && !taken.contains(&(Modifiers::NONE, key)) {
-                fire.push(format!("label:{label}"));
-            }
-        }
-        if grid_navigation {
-            // Home / End: the first / last photo of the view
-            for (key, id) in [(Key::Home, "grid:first"), (Key::End, "grid:last")] {
-                if matches(i, Modifiers::NONE, key) && !taken.contains(&(Modifiers::NONE, key)) {
-                    fire.push(id.to_string());
-                }
-            }
-            // Shift+← / Shift+→: the previous / next photo of the view joins the selection
-            for (key, step) in [(Key::ArrowLeft, -1i64), (Key::ArrowRight, 1)] {
-                if matches(i, Modifiers::SHIFT, key) && !taken.contains(&(Modifiers::SHIFT, key)) {
-                    fire.push(format!("grid:extend:{step}"));
-                }
-            }
-        }
+        fixed_photo_keys(i, &native, &taken, grid_navigation, &mut fire);
     });
-    use crate::panels::compare;
-    // rating/flag/label keys: in Compare/Survey they act on the active photo only; Shift+key or
-    // Auto Advance then moves on (next candidate in Compare, next photo elsewhere)
-    let cull = |app: &mut LightcraftApp, id: &str, mut params: serde_json::Value, advance: bool| {
-        compare::target_active(app, &mut params);
-        let was = app.session.active();
-        let ok = app.run(id, params).is_ok();
-        if ok && (advance || app.ui.auto_advance) {
-            compare::advance(app, was);
+    (fire, aliased)
+}
+
+/// The fixed photo keys pressed: ratings 0-5, colour labels 6-9 (with Shift: and advance), and in a grid the
+/// navigation keys. Keys the user gave to a command (`taken`) and the native menu's (`native`) are left alone.
+fn fixed_photo_keys(i: &egui::InputState, native: &dyn Fn(&str) -> bool, taken: &[(Modifiers, Key)], grid_navigation: bool, fire: &mut Vec<String>) {
+    // rating and colour-label keys
+    for (n, key) in [Key::Num0, Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5].iter().enumerate() {
+        if matches(i, Modifiers::NONE, *key) && !native(&n.to_string()) && !taken.contains(&(Modifiers::NONE, *key)) {
+            fire.push(format!("rate:{n}:0"));
         }
-    };
-    for (id, params) in aliased {
-        // a slideshow: Space pauses / resumes
-        if id == "view.zoomToggle" && app.ui.slideshow.is_some() {
-            if let Ok(v) = app.run("slideshow.togglePause", json!({})) {
-                app.toast(ctx, crate::i18n::tr(if v["paused"] == true { "Slideshow paused" } else { "Slideshow resumed" }));
-            }
-            continue;
-        }
-        // flag/rate aliases (Shift+X…) go through the culling path: active photo in Compare/Survey,
-        // `advance` moves to the next candidate there
-        if matches!(id, "photo.flag" | "photo.rate" | "photo.label") {
-            let mut params = params;
-            let advance = params.get("advance").and_then(serde_json::Value::as_bool).unwrap_or(false);
-            if let Some(o) = params.as_object_mut() {
-                o.remove("advance");
-            }
-            if id == "photo.label" {
-                let label = params.get("label").and_then(serde_json::Value::as_str).unwrap_or_default().to_string();
-                params = label_shortcut_params(app, &label, params);
-            }
-            cull(app, id, params, advance);
-        } else if let Err(e) = app.run(id, params)
-            && matches!(id, "app.export" | "app.exportPrevious")
-        {
-            // an export that can't start (e.g. no folder) says why instead of doing nothing
-            app.toast(ctx, e);
+        if matches(i, Modifiers::SHIFT, *key) && !taken.contains(&(Modifiers::SHIFT, *key)) {
+            fire.push(format!("rate:{n}:1"));
         }
     }
-    let rotate_fires = fire.iter().any(|f| f == "crop.rotateAspect");
-    for f in fire {
-        // a slideshow: ←/→ step (a cut)
-        if app.ui.slideshow.is_some() && matches!(f.as_str(), "library.next" | "library.previous") {
-            let _ = app.run(if f == "library.next" { "slideshow.next" } else { "slideshow.previous" }, json!({}));
-            continue;
+    for (label, key, sc) in [("red", Key::Num6, "6"), ("yellow", Key::Num7, "7"), ("green", Key::Num8, "8"), ("blue", Key::Num9, "9")] {
+        if matches_without_repeat(i, Modifiers::NONE, key) && !native(sc) && !taken.contains(&(Modifiers::NONE, key)) {
+            fire.push(format!("label:{label}"));
         }
-        if let Some(rest) = f.strip_prefix("rate:") {
-            let (n, adv) = rest.split_once(':').unwrap_or(("0", "0"));
-            cull(app, "photo.rate", json!({"rating": n.parse::<u8>().unwrap_or(0)}), adv == "1");
-            let label = if n == "0" {
-                crate::i18n::tr("Rating cleared").to_string()
-            } else {
-                crate::i18n::tr_format!("Rated {}", "★".repeat(n.parse().unwrap_or(0)))
-            };
-            app.toast(ctx, label);
-        } else if matches!(f.as_str(), "photo.decreaseRating" | "photo.increaseRating") {
-            cull(app, &f, json!({}), false);
-        } else if let Some(l) = f.strip_prefix("label:") {
-            let params = label_shortcut_params(app, l, json!({"label": l}));
-            cull(app, "photo.label", params, false);
-        } else if f == "panel.presets" && library_grid(app) {
-            // Classic's Shift+P picks and advances in Library; keep the Presets binding elsewhere.
-            cull(app, "photo.flag", json!({"flag": "pick"}), true);
-        } else if f == "view.softProof" && matches!(app.ui.view, crate::state::ViewMode::PhotoGrid | crate::state::ViewMode::SquareGrid) {
-            // S in a grid: expand / collapse the stack (Lightroom's Library binding)
-            let _ = app.run("stack.toggle", json!({}));
-        } else if f == "grid:first" || f == "grid:last" {
-            // Home / End in a grid: make the first / last photo of the view the active, selected one
-            let vis = app.session.visible_cloned();
-            let edge = if f == "grid:first" { vis.first() } else { vis.last() };
-            if let Some(id) = edge {
-                let _ = app.run("library.select", json!({"ids": [id.0], "active": id.0}));
-            }
-        } else if let Some(step) = f.strip_prefix("grid:extend:") {
-            // Shift+← / Shift+→ in a grid: the neighbour of the active photo joins the selection and
-            // becomes the active one. At either end of the view the key does nothing.
-            let step = step.parse::<i64>().unwrap_or(0);
-            let vis = app.session.visible_cloned();
-            let neighbour = app
-                .session
-                .active()
-                .and_then(|active| vis.iter().position(|p| *p == active))
-                .and_then(|pos| i64::try_from(pos).ok())
-                .and_then(|pos| pos.checked_add(step))
-                .and_then(|pos| usize::try_from(pos).ok())
-                .and_then(|pos| vis.get(pos));
-            if let Some(id) = neighbour {
-                let _ = app.run("library.select", json!({"ids": [id.0], "mode": "add"}));
-            }
-        } else if compare::culling(app) && (f == "library.next" || f == "library.previous") {
-            let d = if f == "library.next" { 1 } else { -1 };
-            let _ = if app.ui.view == crate::state::ViewMode::Compare { compare::compare_step(app, d) } else { compare::survey_step(app, d) };
-        } else if matches!(f.as_str(), "photo.cycleFlag" | "photo.increaseFlag" | "photo.decreaseFlag") {
-            // `, ⌘↑, ⌘↓: step the flag; the toast names the active photo's new state (read before Auto Advance moves on)
-            let active = app.session.active();
-            cull(app, &f, json!({}), false);
-            let flag = active.and_then(|id| app.session.catalog.photo(id)).map(|p| p.flag);
-            match flag {
-                Some(lightcraft_catalog::Flag::Pick) => app.toast(ctx, crate::i18n::tr("Flagged as Pick")),
-                Some(lightcraft_catalog::Flag::Reject) => app.toast(ctx, crate::i18n::tr("Flagged as Reject")),
-                Some(lightcraft_catalog::Flag::None) => app.toast(ctx, crate::i18n::tr("Unflagged")),
-                None => {}
-            }
-        } else if matches!(f.as_str(), "photo.pick" | "photo.reject" | "photo.unflag") && app.ui.right != crate::state::RightPanel::Crop {
-            cull(app, &f, json!({}), false);
-            match f.as_str() {
-                "photo.pick" => app.toast(ctx, crate::i18n::tr("Flagged as Pick")),
-                "photo.reject" => app.toast(ctx, crate::i18n::tr("Flagged as Reject")),
-                _ => app.toast(ctx, crate::i18n::tr("Unflagged")),
-            }
+    }
+    if !grid_navigation {
+        return;
+    }
+    // Home / End: the first / last photo of the view
+    for (key, id) in [(Key::Home, "grid:first"), (Key::End, "grid:last")] {
+        if matches(i, Modifiers::NONE, key) && !taken.contains(&(Modifiers::NONE, key)) {
+            fire.push(id.to_string());
+        }
+    }
+    // Shift+← / Shift+→: the previous / next photo of the view joins the selection
+    for (key, step) in [(Key::ArrowLeft, -1i64), (Key::ArrowRight, 1)] {
+        if matches(i, Modifiers::SHIFT, key) && !taken.contains(&(Modifiers::SHIFT, key)) {
+            fire.push(format!("grid:extend:{step}"));
+        }
+    }
+}
+
+/// Rating/flag/label keys: in Compare/Survey they act on the active photo only; `advance` (Shift+key) or
+/// Auto Advance then moves on (next candidate in Compare, next photo elsewhere).
+fn cull(app: &mut LightcraftApp, id: &str, mut params: serde_json::Value, advance: bool) {
+    use crate::panels::compare;
+    compare::target_active(app, &mut params);
+    let was = app.session.active();
+    let ok = app.run(id, params).is_ok();
+    if ok && (advance || app.ui.auto_advance) {
+        compare::advance(app, was);
+    }
+}
+
+/// Run a fixed alias (a second key for a command).
+fn fire_alias(app: &mut LightcraftApp, ctx: &egui::Context, id: &str, params: serde_json::Value) {
+    // a slideshow: Space pauses / resumes
+    if id == "view.zoomToggle" && app.ui.slideshow.is_some() {
+        if let Ok(v) = app.run("slideshow.togglePause", json!({})) {
+            app.toast(ctx, crate::i18n::tr(if v["paused"] == true { "Slideshow paused" } else { "Slideshow resumed" }));
+        }
+        return;
+    }
+    // flag/rate aliases (Shift+X…) go through the culling path: active photo in Compare/Survey,
+    // `advance` moves to the next candidate there
+    if matches!(id, "photo.flag" | "photo.rate" | "photo.label") {
+        let mut params = params;
+        let advance = params.get("advance").and_then(serde_json::Value::as_bool).unwrap_or(false);
+        if let Some(o) = params.as_object_mut() {
+            o.remove("advance");
+        }
+        if id == "photo.label" {
+            let label = params.get("label").and_then(serde_json::Value::as_str).unwrap_or_default().to_string();
+            params = label_shortcut_params(app, &label, params);
+        }
+        cull(app, id, params, advance);
+    } else if let Err(e) = app.run(id, params)
+        && matches!(id, "app.export" | "app.exportPrevious")
+    {
+        // an export that can't start (e.g. no folder) says why instead of doing nothing
+        app.toast(ctx, e);
+    }
+}
+
+/// The toast naming a flag.
+fn flag_toast(app: &mut LightcraftApp, ctx: &egui::Context, flag: lightcraft_catalog::Flag) {
+    use lightcraft_catalog::Flag;
+    app.toast(
+        ctx,
+        crate::i18n::tr(match flag {
+            Flag::Pick => "Flagged as Pick",
+            Flag::Reject => "Flagged as Reject",
+            Flag::None => "Unflagged",
+        }),
+    );
+}
+
+/// Run one fired command.
+fn fire_command(app: &mut LightcraftApp, ctx: &egui::Context, f: &str, rotate_fires: bool) {
+    // a slideshow: ←/→ step (a cut)
+    if app.ui.slideshow.is_some() && matches!(f, "library.next" | "library.previous") {
+        let _ = app.run(if f == "library.next" { "slideshow.next" } else { "slideshow.previous" }, json!({}));
+        return;
+    }
+    if fire_rating_key(app, ctx, f) || fire_grid_key(app, f) || fire_flag_key(app, ctx, f) {
+        return;
+    }
+    // in the full-screen preview (no panels) I cycles the info overlay instead
+    if f == "panel.info" && app.ui.fullscreen {
+        let _ = app.run("view.infoOverlay", json!({}));
+        return;
+    }
+    if (f == "photo.delete" && delete_key(app, ctx)) || (f == "tool.brush" && brush_key(app, ctx)) || context_key_skipped(app, f, rotate_fires) {
+        return;
+    }
+    if matches!(f, "library.up" | "library.down") {
+        up_down_key(app, ctx, f);
+        return;
+    }
+    // an export that can't start (e.g. no folder) says why instead of doing nothing
+    if let Err(e) = app.run(f, json!({}))
+        && matches!(f, "app.export" | "app.exportPrevious")
+    {
+        app.toast(ctx, e);
+    }
+    match f {
+        "photo.pick" => flag_toast(app, ctx, lightcraft_catalog::Flag::Pick),
+        "photo.reject" => flag_toast(app, ctx, lightcraft_catalog::Flag::Reject),
+        "photo.unflag" => flag_toast(app, ctx, lightcraft_catalog::Flag::None),
+        "edit.undo" => app.toast(ctx, crate::i18n::tr("Undo")),
+        "edit.redo" => app.toast(ctx, crate::i18n::tr("Redo")),
+        _ => {}
+    }
+}
+
+/// Rating and colour label keys; whether `f` was one.
+fn fire_rating_key(app: &mut LightcraftApp, ctx: &egui::Context, f: &str) -> bool {
+    if let Some(rest) = f.strip_prefix("rate:") {
+        let (n, adv) = rest.split_once(':').unwrap_or(("0", "0"));
+        cull(app, "photo.rate", json!({"rating": n.parse::<u8>().unwrap_or(0)}), adv == "1");
+        let label = if n == "0" {
+            crate::i18n::tr("Rating cleared").to_string()
         } else {
-            // in the full-screen preview (no panels) I cycles the info overlay instead
-            if f == "panel.info" && app.ui.fullscreen {
-                let _ = app.run("view.infoOverlay", json!({}));
-                continue;
+            crate::i18n::tr_format!("Rated {}", "★".repeat(n.parse().unwrap_or(0)))
+        };
+        app.toast(ctx, label);
+    } else if matches!(f, "photo.decreaseRating" | "photo.increaseRating") {
+        cull(app, f, json!({}), false);
+    } else if let Some(l) = f.strip_prefix("label:") {
+        let params = label_shortcut_params(app, l, json!({"label": l}));
+        cull(app, "photo.label", params, false);
+    } else {
+        return false;
+    }
+    true
+}
+
+/// The keys of a grid or of Compare / Survey that move the active photo or the selection; whether `f` was one.
+fn fire_grid_key(app: &mut LightcraftApp, f: &str) -> bool {
+    use crate::panels::compare;
+    if f == "panel.presets" && library_grid(app) {
+        // Classic's Shift+P picks and advances in Library; keep the Presets binding elsewhere.
+        cull(app, "photo.flag", json!({"flag": "pick"}), true);
+    } else if f == "view.softProof" && library_grid(app) {
+        // S in a grid: expand / collapse the stack (Lightroom's Library binding)
+        let _ = app.run("stack.toggle", json!({}));
+    } else if f == "grid:first" || f == "grid:last" {
+        // Home / End in a grid: make the first / last photo of the view the active, selected one
+        let vis = app.session.visible_cloned();
+        let edge = if f == "grid:first" { vis.first() } else { vis.last() };
+        if let Some(id) = edge {
+            let _ = app.run("library.select", json!({"ids": [id.0], "active": id.0}));
+        }
+    } else if let Some(step) = f.strip_prefix("grid:extend:") {
+        extend_selection(app, step.parse::<i64>().unwrap_or(0));
+    } else if compare::culling(app) && (f == "library.next" || f == "library.previous") {
+        let d = if f == "library.next" { 1 } else { -1 };
+        let _ = if app.ui.view == crate::state::ViewMode::Compare { compare::compare_step(app, d) } else { compare::survey_step(app, d) };
+    } else {
+        return false;
+    }
+    true
+}
+
+/// Shift+← / Shift+→ in a grid: the neighbour of the active photo joins the selection and
+/// becomes the active one. At either end of the view the key does nothing.
+fn extend_selection(app: &mut LightcraftApp, step: i64) {
+    let vis = app.session.visible_cloned();
+    let neighbour = app
+        .session
+        .active()
+        .and_then(|active| vis.iter().position(|p| *p == active))
+        .and_then(|pos| i64::try_from(pos).ok())
+        .and_then(|pos| pos.checked_add(step))
+        .and_then(|pos| usize::try_from(pos).ok())
+        .and_then(|pos| vis.get(pos));
+    if let Some(id) = neighbour {
+        let _ = app.run("library.select", json!({"ids": [id.0], "mode": "add"}));
+    }
+}
+
+/// The flag keys; whether `f` was one.
+fn fire_flag_key(app: &mut LightcraftApp, ctx: &egui::Context, f: &str) -> bool {
+    if matches!(f, "photo.cycleFlag" | "photo.increaseFlag" | "photo.decreaseFlag") {
+        // `, ⌘↑, ⌘↓: step the flag; the toast names the active photo's new state (read before Auto Advance moves on)
+        let active = app.session.active();
+        cull(app, f, json!({}), false);
+        if let Some(flag) = active.and_then(|id| app.session.catalog.photo(id)).map(|p| p.flag) {
+            flag_toast(app, ctx, flag);
+        }
+        true
+    } else if matches!(f, "photo.pick" | "photo.reject" | "photo.unflag") && app.ui.right != crate::state::RightPanel::Crop {
+        cull(app, f, json!({}), false);
+        let flag = match f {
+            "photo.pick" => lightcraft_catalog::Flag::Pick,
+            "photo.reject" => lightcraft_catalog::Flag::Reject,
+            _ => lightcraft_catalog::Flag::None,
+        };
+        flag_toast(app, ctx, flag);
+        true
+    } else {
+        false
+    }
+}
+
+/// Delete acts on what's being edited: the active mask in the Masking panel; never the photo while retouching (spots
+/// are removed from their own panel). Whether the key was used up.
+fn delete_key(app: &mut LightcraftApp, ctx: &egui::Context) -> bool {
+    use crate::state::RightPanel as R;
+    match app.ui.right {
+        R::Masking => {
+            if app.session.active_mask.is_some() {
+                let _ = app.run("mask.delete", json!({}));
             }
-            // Delete acts on what's being edited: the active mask in the Masking panel; never the
-            // photo while retouching (spots are removed from their own panel).
-            if f == "photo.delete" {
-                use crate::state::RightPanel as R;
-                match app.ui.right {
-                    R::Masking => {
-                        if app.session.active_mask.is_some() {
-                            let _ = app.run("mask.delete", json!({}));
-                        }
-                        continue;
-                    }
-                    R::Remove => {
-                        if app.session.active_spot.is_some() {
-                            let _ = app.run("spot.delete", json!({}));
-                        }
-                        continue;
-                    }
-                    R::Crop if app.ui.tool == "guidedUpright" => {
-                        // Delete removes the selected guide alone; with none selected it removes
-                        // nothing (the photo itself is never deleted while the tool is open)
-                        if let (Some((photo, i)), Some(active)) = (app.ui.selected_guide, app.session.active()) {
-                            if photo == active.0
-                                && let Some(d) = app.session.develop_of(active)
-                                && i < d.geometry.guides.len()
-                            {
-                                let guides: Vec<[f64; 4]> =
-                                    d.geometry.guides.iter().enumerate().filter(|(k, _)| *k != i).map(|(_, (a, b))| [a.x, a.y, b.x, b.y]).collect();
-                                let _ = app.run("geometry.guides", json!({"guides": guides}));
-                            }
-                            app.ui.selected_guide = None;
-                        }
-                        continue;
-                    }
-                    R::RedEye => continue,
-                    _ => {}
-                }
-                // in an album, Delete takes the photos out of the album only, as in Lightroom: they
-                // stay in the library and their folder (issue #1805)
-                if crate::menus::delete_in_album(app, ctx) {
-                    continue;
-                }
-                if crate::menus::confirm_delete(app) {
-                    continue;
-                }
+            return true;
+        }
+        R::Remove => {
+            if app.session.active_spot.is_some() {
+                let _ = app.run("spot.delete", json!({}));
             }
-            // B: the brush while editing; in the grids, add to the target album (Quick Collection)
-            if f == "tool.brush" && matches!(app.ui.view, crate::state::ViewMode::PhotoGrid | crate::state::ViewMode::SquareGrid) {
-                if let Ok(r) = app.run("album.toggleTarget", json!({})) {
-                    let n = app.session.selected().len();
-                    let what = crate::i18n::tr_format!("{n} photo{}", if n == 1 { "" } else { "s" }, n = n);
-                    let name = r["name"].as_str().unwrap_or("Quick Collection").to_string();
-                    app.toast(
-                        ctx,
-                        if r["added"] == true {
-                            crate::i18n::tr_format!("Added {what} to {name}", name = name, what = what)
-                        } else {
-                            crate::i18n::tr_format!("Removed {what} from {name}", name = name, what = what)
-                        },
-                    );
-                }
-                continue;
+            return true;
+        }
+        R::Crop if app.ui.tool == "guidedUpright" => {
+            delete_selected_guide(app);
+            return true;
+        }
+        R::RedEye => return true,
+        _ => {}
+    }
+    // in an album, Delete takes the photos out of the album only, as in Lightroom: they
+    // stay in the library and their folder (issue #1805)
+    crate::menus::delete_in_album(app, ctx) || crate::menus::confirm_delete(app)
+}
+
+/// Delete removes the selected guide alone; with none selected it removes nothing (the photo itself is never deleted
+/// while the tool is open).
+fn delete_selected_guide(app: &mut LightcraftApp) {
+    let (Some((photo, i)), Some(active)) = (app.ui.selected_guide, app.session.active()) else { return };
+    if photo == active.0
+        && let Some(d) = app.session.develop_of(active)
+        && i < d.geometry.guides.len()
+    {
+        let guides: Vec<[f64; 4]> = d.geometry.guides.iter().enumerate().filter(|(k, _)| *k != i).map(|(_, (a, b))| [a.x, a.y, b.x, b.y]).collect();
+        let _ = app.run("geometry.guides", json!({"guides": guides}));
+    }
+    app.ui.selected_guide = None;
+}
+
+/// B: the brush while editing; in the grids, add to the target album (Quick Collection). Whether the key was used up.
+fn brush_key(app: &mut LightcraftApp, ctx: &egui::Context) -> bool {
+    if !library_grid(app) {
+        return false;
+    }
+    if let Ok(r) = app.run("album.toggleTarget", json!({})) {
+        let n = app.session.selected().len();
+        let what = crate::i18n::tr_format!("{n} photo{}", if n == 1 { "" } else { "s" }, n = n);
+        let name = r["name"].as_str().unwrap_or("Quick Collection").to_string();
+        app.toast(
+            ctx,
+            if r["added"] == true {
+                crate::i18n::tr_format!("Added {what} to {name}", name = name, what = what)
+            } else {
+                crate::i18n::tr_format!("Removed {what} from {name}", name = name, what = what)
+            },
+        );
+    }
+    true
+}
+
+/// Keys that two bindings share, and that mean something only in one panel: whether `f` was used up (or ignored)
+/// here, so nothing else runs for it.
+fn context_key_skipped(app: &mut LightcraftApp, f: &str, rotate_fires: bool) -> bool {
+    use crate::state::RightPanel as R;
+    let right = app.ui.right;
+    match f {
+        // X is both reject (library) and swap crop aspect (crop tool). When both bindings fire,
+        // swap once: twice would put the crop straight back (issue #1866).
+        "photo.reject" if right == R::Crop => {
+            if !rotate_fires {
+                let _ = app.run("crop.rotateAspect", json!({}));
             }
-            // X is both reject (library) and swap crop aspect (crop tool). When both bindings fire,
-            // swap once: twice would put the crop straight back (issue #1866).
-            if f == "photo.reject" && app.ui.right == crate::state::RightPanel::Crop {
-                if !rotate_fires {
-                    let _ = app.run("crop.rotateAspect", json!({}));
-                }
-                continue;
-            }
-            if f == "crop.rotateAspect" && app.ui.right != crate::state::RightPanel::Crop {
-                continue;
-            }
-            // A is both Visualize Spots and the crop aspect lock: each key only in its own context
-            if f == "view.visualizeSpots" && app.ui.right == crate::state::RightPanel::Crop {
-                continue;
-            }
-            if f == "crop.lockAspect" && app.ui.right != crate::state::RightPanel::Crop {
-                continue;
-            }
-            // / refreshes the selected spot's source in the Remove tool (the filmstrip elsewhere)
-            if f == "view.filmstrip" && app.ui.right == crate::state::RightPanel::Remove && app.session.active_spot.is_some() {
-                let _ = app.run("spot.refreshSource", json!({}));
-                continue;
-            }
-            // Shift+O cycles the mask overlay colour while masking (the crop overlay elsewhere)
-            if f == "view.cropOverlay" && app.ui.right == crate::state::RightPanel::Masking {
-                let _ = app.run("view.maskOverlayColor", json!({}));
-                continue;
-            }
-            // while cropping: O cycles the guides, Shift+O their orientation
-            if app.ui.right == crate::state::RightPanel::Crop {
-                let crop_key = match f.as_str() {
-                    "view.maskOverlay" => Some(("view.cropOverlay", json!({}))),
-                    "view.cropOverlay" => Some(("view.cropOverlayOrientation", json!({}))),
-                    _ => None,
-                };
-                if let Some((cmd, p)) = crop_key {
-                    let _ = app.run(cmd, p);
-                    continue;
-                }
-            }
-            // Up / Down in the grids go to the cell above / below (the filmstrip steps one photo)
-            if matches!(f.as_str(), "library.up" | "library.down") {
-                // over a slider the arrows nudge it (widgets::slider takes the key)
-                let over_slider =
-                    ctx.pointer_hover_pos().is_some_and(|p| app.widgets.iter().any(|(id, r)| id.starts_with("slider:") && r.contains(p)));
-                if over_slider {
-                    continue;
-                }
-                match crate::panels::grid::row_distance(app, f == "library.down") {
-                    Some(0) => {}
-                    Some(rows) => {
-                        let _ = app.run(&f, json!({"rows": rows}));
-                    }
-                    None => {
-                        let _ = app.run(&f, json!({}));
-                    }
-                }
-                continue;
-            }
-            // an export that can't start (e.g. no folder) says why instead of doing nothing
-            if let Err(e) = app.run(&f, json!({}))
-                && matches!(f.as_str(), "app.export" | "app.exportPrevious")
-            {
-                app.toast(ctx, e);
-            }
-            match f.as_str() {
-                "photo.pick" => app.toast(ctx, crate::i18n::tr("Flagged as Pick")),
-                "photo.reject" => app.toast(ctx, crate::i18n::tr("Flagged as Reject")),
-                "photo.unflag" => app.toast(ctx, crate::i18n::tr("Unflagged")),
-                "edit.undo" => app.toast(ctx, crate::i18n::tr("Undo")),
-                "edit.redo" => app.toast(ctx, crate::i18n::tr("Redo")),
-                _ => {}
-            }
+            true
+        }
+        "crop.rotateAspect" => right != R::Crop,
+        // A is both Visualize Spots and the crop aspect lock: each key only in its own context
+        "view.visualizeSpots" => right == R::Crop,
+        "crop.lockAspect" => right != R::Crop,
+        // / refreshes the selected spot's source in the Remove tool (the filmstrip elsewhere)
+        "view.filmstrip" if right == R::Remove && app.session.active_spot.is_some() => {
+            let _ = app.run("spot.refreshSource", json!({}));
+            true
+        }
+        // Shift+O cycles the mask overlay colour while masking (the crop overlay elsewhere)
+        "view.cropOverlay" if right == R::Masking => {
+            let _ = app.run("view.maskOverlayColor", json!({}));
+            true
+        }
+        // while cropping: O cycles the guides, Shift+O their orientation
+        "view.maskOverlay" if right == R::Crop => {
+            let _ = app.run("view.cropOverlay", json!({}));
+            true
+        }
+        "view.cropOverlay" if right == R::Crop => {
+            let _ = app.run("view.cropOverlayOrientation", json!({}));
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Up / Down in the grids go to the cell above / below (the filmstrip steps one photo).
+fn up_down_key(app: &mut LightcraftApp, ctx: &egui::Context, f: &str) {
+    // over a slider the arrows nudge it (widgets::slider takes the key)
+    let over_slider = ctx.pointer_hover_pos().is_some_and(|p| app.widgets.iter().any(|(id, r)| id.starts_with("slider:") && r.contains(p)));
+    if over_slider {
+        return;
+    }
+    match crate::panels::grid::row_distance(app, f == "library.down") {
+        Some(0) => {}
+        Some(rows) => {
+            let _ = app.run(f, json!({"rows": rows}));
+        }
+        None => {
+            let _ = app.run(f, json!({}));
         }
     }
 }
@@ -745,7 +802,8 @@ fn label_shortcut_params(app: &LightcraftApp, label_name: &str, mut params: serd
 }
 
 #[cfg(test)]
-mod tests {
+#[cfg(any())]
+mod legacy_tests {
 
     fn library() -> crate::headless::Headless {
         use lightcraft_catalog::{Op, Photo, PhotoId, Source};
@@ -1517,6 +1575,9 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
 
 #[cfg(test)]
 #[path = "shortcuts/tests_relative_ratings.rs"]
